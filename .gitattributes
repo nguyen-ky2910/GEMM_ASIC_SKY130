@@ -1,6 +1,0 @@
-*.sh text eol=lf
-*.py text eol=lf
-*.tcl text eol=lf
-*.cfg text eol=lf
-*.md text eol=lf
-*.sha256 text eol=lf

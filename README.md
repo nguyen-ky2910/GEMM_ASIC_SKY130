@@ -1,310 +1,148 @@
-# GEMM 32×32 ASIC — OpenLane Reproducibility Package
+# GEMM 32x32 INT8 trên SKY130
+link Drive dự án: https://drive.google.com/drive/u/0/folders/1rQGXBQMxBw7CRs1iQ_FK7p_eN03Ah15e
 
-Tài liệu này mô tả cách tái lập bản physical design:
+## Hồ sơ cho giám khảo
 
-~~~text
-area7000x5500_density40_macrospaced_v2
-~~~
+Quy ước phiên bản: **v0** là bản demo `core_v11`, **v1** là bản sạch đầu tiên (IP `gemm_ip`, signoff ở 50 MHz), **v2** là bản đang làm. Số liệu nộp cuộc thi là của v1.
 
-Đây là bản triển khai ASIC của bộ gia tốc nhân ma trận GEMM INT8, sử dụng systolic array 32×32 trên PDK SKY130A. Mục tiêu của bản này là giảm nghẽn dây bằng cách tăng diện tích chip và bố trí thủ công 16 SRAM macro thành hai cột ở hai mép vùng core.
-
-> **Trạng thái hiện tại:** synthesis, floorplan, placement và CTS đã hoàn thành. Flow dừng tại routing-resizer với lỗi **GRT-0119** do routing congestion. Đây là bản tốt nhất trong các run đã so sánh theo số congestion marker, nhưng **chưa phải thiết kế signoff và chưa có GDS hoàn chỉnh**.
-
-## 1. Tổng quan hệ thống
-
-Thiết kế thực hiện phép nhân ma trận bằng mảng systolic 32×32 gồm 1.024 Processing Element (PE), theo cơ chế weight-stationary.
-
-~~~mermaid
-flowchart TD
-    A["Feature SRAM"] --> C["Input / Feeder buffers"]
-    B["Weight SRAM"] --> C
-    C --> D["Systolic array 32×32<br/>1.024 PE"]
-    D --> E["Output buffers"]
-    E --> F["Output SRAM"]
-~~~
-
-| Thành phần | Vai trò |
+| Cần xem | Ở đâu |
 |---|---|
-| RTL GEMM | Điều khiển luồng dữ liệu và phép nhân–tích lũy |
-| Systolic array 32×32 | Thực hiện song song 1.024 phép MAC theo nhịp |
-| PE | Nhân hai toán hạng INT8 và cộng vào giá trị tích lũy |
-| Input/feeder buffer | Đưa feature và weight vào mảng theo đúng chu kỳ |
-| Output buffer | Thu và sắp xếp kết quả từ mảng |
-| SRAM macro | Lưu feature, weight và output dưới dạng hard macro ASIC |
+| Kết quả signoff v1 (DRC, LVS, antenna, timing, công suất) | mục "Bản v1" bên dưới, `docs/TIEN_DO_SIGNOFF.md` |
+| RTL đầy đủ của bản ASIC | `rtl_asic/` (vỏ AXI ở `rtl_asic/axi/`) |
+| Testbench và script mô phỏng | `sim/` |
+| Dạng sóng RTL, log GLS, so với golden model Python | `docs/evidence/` |
+| Gói số liệu và hình của layout (IR drop, slack, mật độ, ECO) | `docs/paper/` (`SUMMARY.md`, `data/`, `figures/`) |
+| Flow OpenLane và script ECO | `openlane/`, `tools/eco/` |
+| Bản FPGA KV260 (RTL gốc, testbench gốc, golden model, tích hợp llama.cpp) | https://github.com/VinhPT-Lab/GEMM_32x32_KV260 |
+| Website giới thiệu, có layout 3D từ GDS/DEF thật | https://nguyen-ky2910.github.io/WEB_GEMM_32x32_FPGT/ |
 
-Thiết kế gốc hướng đến FPGA và có thể dùng DSP IP. Khi chuyển sang ASIC, DSP48 không còn tồn tại trong PDK SKY130. Phép nhân trong PE được mô tả bằng RTL signed arithmetic và được tổng hợp thành các standard cell của thư viện **sky130_fd_sc_hd**.
+Kiểm chứng tóm tắt:
+- RTL ASIC chạy testbench gốc của bản KV260 (2 job 64×64×64): PASS, 8192/8192 phần tử khớp golden model Python (`sim/run_wave.sh`).
+- GLS trên netlist cuối của v1: 64×64×64, 8×32×544, 16×992×32 đều PASS; ở 64×64×64 có 0 mismatch và khớp golden model Python.
+- Layout v1: Magic DRC 0, LVS khớp, antenna 0, KLayout XOR 0, DRV 0.
 
-## 2. Mục tiêu của run macrospaced_v2
+Tệp layout lớn không đưa vào git: `GEMM_top.gds` (708,7 MiB), `GEMM_top.def` (469,1 MiB), netlist `GEMM_top.nl.v` (196,5 MiB), cùng LEF, Liberty, SDC và các báo cáo DRC/LVS/STA. Tải ở thư mục `final` của v1 trên Drive (ai có link đều xem được): https://drive.google.com/drive/folders/1SNKjXqcsqroH8pAdLk6_jX4fOtAbhqEZ. GDS cuối có sha256 `87286b9408d1a706d1f47a2925317ed5ed702c0700b780edbdda0a22e8b068fa`.
 
-Các run trước gặp nghẽn routing nghiêm trọng quanh cụm SRAM và vùng trung tâm. Bản **macrospaced_v2** giữ die 7.000 × 5.500 µm, đặt 16 SRAM thành hai cột để:
+Bộ tăng tốc nhân ma trận INT8 32x32 kiểu weight-stationary. Bản gốc chạy trên FPGA KV260;
+repo này đưa nó ra layout trên SKY130 bằng OpenLane 1.0.2. Thiết kế được harden theo tầng:
+PE, row (32 PE), array, rồi core GemmAccelerator gồm 32 row macro và 80 SRAM OpenRAM.
 
-- giải phóng vùng giữa cho 1.024 PE và logic điều khiển;
-- tạo khoảng trống giữa các macro cho nguồn và đường tín hiệu;
-- tách nhóm SRAM đầu vào khỏi nhóm SRAM đầu ra;
-- giảm số congestion marker so với các phương án đã thử.
+## Bản v0 (demo, core_v11)
 
-~~~mermaid
-flowchart LR
-    L["Cột trái<br/>8 SRAM input + feeder"] --- C["Vùng trung tâm<br/>standard cells + systolic array"]
-    C --- R["Cột phải<br/>8 SRAM output"]
-~~~
+Bảng này là của run core_v11 chạy riêng, ở chu kỳ 10 ns (100 MHz). STA của run này chưa kiểm các path đi qua
+macro (SRAM, row). Khi kiểm đủ, fmax ở tt chỉ khoảng 53 MHz, nên mọi con số tính ở 100 MHz dưới đây là **giả định**
+**100 MHz**, không phải tần số đã đạt. Kết quả đã signoff là của IP gemm_ip ở 50 MHz, ở phần sau.
 
-### Phân nhóm 16 SRAM
-
-| Vị trí | Số macro | Chức năng |
-|---|---:|---|
-| Cột trái | 2 | Input feature buffer |
-| Cột trái | 2 | Input weight buffer |
-| Cột trái | 2 | Feature feeder buffer |
-| Cột trái | 2 | Weight feeder buffer |
-| Cột phải | 8 | Output buffer |
-| **Tổng** | **16** | Tất cả dùng cùng một hard macro SRAM vật lý |
-
-Tất cả instance sử dụng macro:
-
-~~~text
-sky130_sram_2kbyte_1rw1r_128x128_128
-~~~
-
-Macro có tổ chức vật lý 128 word × 128 bit, tương đương 16.384 bit = 2 KiB, với một cổng read/write và một cổng read. Các wrapper RTL như **Sram64x256**, **Sram128x256** hoặc **Sram128x1024** biểu diễn giao diện logic mà thiết kế cần; wrapper ghép nhiều macro vật lý và ánh xạ độ rộng/độ sâu phù hợp.
-
-| Wrapper logic | Dung lượng logic | Số macro vật lý | Cách ghép chính |
-|---|---:|---:|---|
-| **Sram64x256** | 64 × 256 bit = 2 KiB | 2 | Hai macro song song để tạo bus 256 bit; chỉ dùng 64 địa chỉ cần thiết |
-| **Sram128x256** | 128 × 256 bit = 4 KiB | 2 | Hai macro song song, mỗi macro cung cấp 128 bit |
-| **Sram128x1024** | 128 × 1024 bit = 16 KiB | 8 | Tám macro song song, tổng độ rộng 1.024 bit |
-
-Vì hard macro chỉ xuất 128 bit mỗi lần đọc, buffer logic rộng 256 bit vẫn cần hai macro chạy song song, dù tổng dung lượng của **Sram64x256** cũng chỉ là 2 KiB.
-
-### Tọa độ bố trí
-
-| Cột | Tọa độ X | Các tọa độ Y | Hướng |
-|---|---:|---|---|
-| Trái | 400 µm | 350, 950, 1550, 2150, 2750, 3350, 3950, 4550 µm | N |
-| Phải | 5700 µm | 350, 950, 1550, 2150, 2750, 3350, 3950, 4550 µm | N |
-
-Kích thước một macro theo LEF là khoảng 683,10 × 416,54 µm. Halo được đặt 20 µm quanh mỗi macro.
-
-## 3. Công nghệ và cấu hình physical design
-
-| Thông số | Giá trị | Ý nghĩa |
-|---|---|---|
-| PDK | **sky130A** | Bộ quy tắc và thư viện công nghệ 130 nm |
-| PDK snapshot | **0fe599b2afb6708d281543108caf8310912f54af** | Phiên bản PDK dùng để tái lập |
-| Standard-cell library | **sky130_fd_sc_hd** | Thư viện cell mật độ cao |
-| OpenLane image | **docker.io/efabless/openlane:2023.12.26** | Phiên bản môi trường chạy cố định |
-| Top module | **GemmAccelerator** | Module cao nhất của thiết kế |
-| Clock port | **i_clk** | Ngõ vào clock |
-| Clock period | 10 ns | Mục tiêu 100 MHz, chưa phải kết quả signoff |
-| Die area | **0 0 7000 5500 µm** | Kích thước die 7,0 × 5,5 mm, diện tích 38,5 mm² |
-| Core area | **200 200 6800 5300 µm** | Vùng đặt standard cell, kích thước 6,6 × 5,1 mm |
-| Placement density | **0.40** | Mục tiêu dùng 40% diện tích hàng standard cell |
-| SRAM | **sky130_sram_2kbyte_1rw1r_128x128_128** | Hard macro 2 KiB |
-| Số SRAM macro | 16 | Tổng số instance vật lý |
-| Macro halo | 20 µm | Khoảng đệm quanh macro |
-
-**7000** và **5500** là kích thước die theo micromet. **density40** là mật độ placement mục tiêu 40%; nó không có nghĩa 40% tổng diện tích die đã được silicon sử dụng.
-
-## 4. Luồng OpenLane và trạng thái hiện tại
-
-~~~mermaid
-flowchart TD
-    A["RTL + SRAM views"] --> B["Lint và synthesis"]
-    B --> C["Floorplan + PDN"]
-    C --> D["Macro + standard-cell placement"]
-    D --> E["CTS"]
-    E --> F["Routing-resizer / global routing"]
-    F -->|GRT-0119| G["Dừng: routing congestion"]
-    F -.->|Chưa đạt| H["Detailed routing + signoff + GDS"]
-~~~
-
-| Giai đoạn | Trạng thái | Kết quả chính |
-|---|---|---|
-| Lint / synthesis | Hoàn thành | RTL được tổng hợp sang cell SKY130 |
-| Floorplan / PDN | Hoàn thành | Die, core, nguồn và vị trí macro được tạo |
-| Placement | Hoàn thành | Standard cell được đặt quanh 16 SRAM |
-| CTS | Hoàn thành | Cây clock được xây dựng |
-| Routing-resizer / global routing | Không đạt | **GRT-0119**, tài nguyên routing không đủ |
-| Detailed routing | Chưa chạy hoàn chỉnh | Phụ thuộc việc giải quyết congestion |
-| STA, DRC, LVS signoff | Chưa đạt | Chưa đủ điều kiện kết luận tape-out |
-| Final GDS | Chưa có | Run hiện tại chưa phải sản phẩm cuối |
-
-### So sánh các run đã xác nhận
-
-| Run | Kết quả liên quan congestion |
-|---|---:|
-| **area5000x6000_density45_fast** | CTS có 103.416 sink và 14.122 clock buffer; dừng GRT-0119 |
-| **area7000x5500_density40_iobalanced_v1** | 6.173 marker; overflow 33.063 |
-| **area7000x5500_density38_iobalanced_v2** | 6.615 marker |
-| **area7000x5500_density40_macrospaced_v2** | **5.557 marker**; overflow 34.313 |
-
-**macrospaced_v2** tốt nhất theo số marker trong nhóm trên, nhưng không có overflow thấp nhất. Vì vậy kết luận đúng là **bố trí macro đã cải thiện congestion nhưng chưa giải quyết hoàn toàn lỗi routing**.
-
-## 5. Cấu trúc gói tái lập
-
-~~~text
-OPENLANE_REPRODUCE_MACROSPACED_V2/
-├── README.md
-├── ENVIRONMENT.md
-├── HISTORY_AND_RESULTS.md
-├── RUNBOOK.md
-├── COMMANDS_COPY_PASTE.sh
-├── MANIFEST.sha256
-├── archive/
-│   └── gemm_macro_spaced_v2_original.py
-├── evidence/
-│   └── README.md
-├── git/
-│   ├── GIT_PUSH_GUIDE.md
-│   └── gitignore_openlane.txt
-├── scripts/
-│   ├── 00_install_host_tools.sh
-│   ├── 01_preflight.sh
-│   ├── 02_capture_for_push.sh
-│   ├── 03_reproduce_macrospaced_v2.py
-│   ├── 04_verify_run.py
-│   ├── 05_extract_shell_history.sh
-│   └── run_all.sh
-└── templates/
-    ├── config_additions.tcl
-    └── macro_placement_spaced_v2.cfg
-~~~
-
-| File / thư mục | Nội dung |
+| Mục | Kết quả |
 |---|---|
-| **README.md** | Tổng quan thiết kế, trạng thái và cách bắt đầu |
-| **ENVIRONMENT.md** | Hệ điều hành, Podman, OpenLane image, PDK và công cụ |
-| **HISTORY_AND_RESULTS.md** | Diễn biến các run, thay đổi và số liệu đã xác nhận |
-| **RUNBOOK.md** | Quy trình build lại theo từng bước |
-| **COMMANDS_COPY_PASTE.sh** | Các lệnh chính để sao chép và chạy nhanh |
-| **MANIFEST.sha256** | Checksum kiểm tra toàn vẹn toàn bộ gói |
-| **archive/** | Script lịch sử đã dùng trên máy tác giả |
-| **evidence/** | Nơi lưu báo cáo nhỏ và bằng chứng sau khi thu thập |
-| **git/** | Hướng dẫn push và mẫu .gitignore |
-| **scripts/** | Script cài đặt, kiểm tra, tái lập và xác minh |
-| **templates/** | Phần cấu hình và tọa độ macro cố định |
+| Die | 7,06 x 10,24 mm (72,3 mm²) |
+| Tần số | 100 MHz ở tt/25°C/1,80V là giả định, không đạt khi kiểm đủ path qua macro (kiểm đủ thì khoảng 53 MHz ở tt). Khoảng 57 MHz ở ss/100°C/1,60V, cũng chưa kiểm path qua macro |
+| DRC | router 0; Magic 0 lỗi thật (48 cờ do view abstract của macro, đã kiểm lại trên layout đầy đủ) |
+| LVS | khớp |
+| Setup / hold | ở chu kỳ 10 ns, chưa gồm path qua macro; path nội bộ ở tt: setup +1,21 ns, hold +0,27 ns; hold sạch ở ff với cả RC min và RC max |
+| Antenna | core_v11 chạy riêng còn 219 pin trên 205 net, vượt nhẹ (trung vị 1,4 lần giới hạn), không chân SRAM nào |
+| Mô phỏng gate-level | netlist core cùng netlist gate-level của 32 row: PASS cả 3 kích thước ma trận (64x64x64, 8x32x544, 16x992x32), trùng từng chu kỳ với RTL FPGA |
+| Công suất | tt/25°C/1,80V, giả định 100 MHz, không đạt khi kiểm đủ path qua macro: 1,53 W với activity từ VCD (mô phỏng gate-level cả core lẫn row, pha tính của ma trận 64x64x64); đo lại bằng bộ đọc VCD đã sửa lỗi alias (đợt 3): không đổi, 1529,70 mW; 2,89 W với activity mặc định của OpenSTA |
+| Hiệu suất | giả định 100 MHz, không đạt khi kiểm đủ path qua macro: đỉnh 204,8 GOPS (2 x 32 x 32 x 100 MHz), 134 GOPS/W (theo 1,53 W), 2,83 GOPS/mm² |
 
-## 6. Dữ liệu bắt buộc trong repository chính
+## Bản v1: IP gemm_ip (core + vỏ AXI), signoff ở 50 MHz
 
-Gói này không thay thế source code của dự án. Trước khi chạy, repository phải có tối thiểu:
+IP đã signoff ở **50 MHz (chu kỳ 20 ns), TT theo lib**, trên layout ECO cuối. Chi tiết ở `docs/TIEN_DO_SIGNOFF.md`.
 
-~~~text
-GEMM_final_DSP_OPENLANE_ASIC/
-├── designs/
-│   └── GemmAccelerator/
-│       ├── config.tcl
-│       ├── pin_order.cfg
-│       ├── src/
-│       │   ├── GemmAccelerator.v
-│       │   ├── ... PE, array, buffer, feeder, control ...
-│       │   └── ... SRAM wrappers ...
-│       └── ... macro views referenced by config ...
-└── OPENLANE_REPRODUCE_MACROSPACED_V2/
-~~~
+| Mục | Kết quả |
+|---|---|
+| Antenna, DRC, LVS | ARC 0; DRT 0; Magic 0; LVS khớp; KLayout XOR 0 |
+| Setup / hold nội bộ | tt: setup +1,43 ns, hold +0,32 ns; hold ff +0,13 ns; hold ss +0,23 ns |
+| DRV | 0 net cell chuẩn vượt giới hạn lib ở tt và ss |
+| Mô phỏng gate-level | PASS cả 3 kích thước, trùng từng chu kỳ với RTL cùng cấu hình |
+| Công suất | 745,1 mW theo VCD cả job (64x64x64; 8x32x544: 751,0; 16x992x32: 753,5 mW; SRAM tính theo lib, là cận trên; nếu lấy SRAM cận dưới thì khoảng 623–626 mW), tt, SPEF RC nom, 50 MHz; tham khảo: 1377,6 mW vectorless (activity mặc định của OpenSTA) |
+| Hiệu suất | đỉnh 102,4 GOPS (2 x 32 x 32 x 50 MHz). Hiệu dụng theo GLS và công suất VCD: 64x64x64 15,9 GOPS, 21,4 GOPS/W, 93,5 pJ/MAC (8x32x544: 3,5 GOPS/W; 16x992x32: 7,0 GOPS/W); năng lượng đo trên cả job. Đỉnh chia công suất đo: 137 GOPS/W, chỉ là cận trên. Chi tiết: docs/paper/SUMMARY.md |
+| Mô hình timing | `GEMM_top.tt.lib` cho người tích hợp (phần I/O) |
 
-Các đầu vào bắt buộc gồm:
+Giới hạn:
+- 50 MHz là con số **TT theo lib**. SRAM OpenRAM chỉ có lib TT, và timing của SRAM là ngoại suy, vì lib chỉ đặc tính hoá slew 1,25–40 ps.
+- SRAM OpenRAM đo trên silicon chạy được khoảng 34–40 MHz.
+- Setup ss của path chạm macro (−4,94 ns ở chu kỳ 20 ns) và hold của path I/O chỉ được báo kèm.
 
-- toàn bộ RTL được **config.tcl** tham chiếu;
-- **config.tcl** và **pin_order.cfg**;
-- wrapper SRAM, gồm các module như **Sram128x256.v**, **Sram64x256.v** và **Sram128x1024.v**;
-- model Verilog cùng các view LEF, Liberty và GDS của SRAM macro;
-- gói tái lập này.
+## Chạy
 
-## 7. Chạy lại nhanh
+Cần OpenLane 1.0.2 (Docker) ở ~/OpenLane, PDK sky130A, iverilog và python3. Repo gốc
+GEMM_32x32_KV260 đặt cạnh thư mục này (dùng testbench của nó). Cài đặt, thời gian, cách đọc
+kết quả và lỗi hay gặp: HUONGDAN.md.
 
-Đặt thư mục này ở thư mục gốc dự án:
+    openlane/run_flow.sh sim        # RTL ASIC so với RTL FPGA
+    openlane/run_flow.sh pe
+    openlane/run_flow.sh row
+    openlane/run_flow.sh array
+    openlane/run_flow.sh core-sim   # RTL core với model SRAM OpenRAM
+    openlane/run_flow.sh core-pre
+    openlane/run_flow.sh core       # khoảng 7-9,5 giờ, cần 16 GB RAM và 40 GB ổ trống
+    openlane/run_flow.sh core-gls   # mô phỏng gate-level netlist cuối
 
-~~~text
-GEMM_final_DSP_OPENLANE_ASIC/
-├── designs/
-├── rtl/
-└── OPENLANE_REPRODUCE_MACROSPACED_V2/
-~~~
+AXI accelerator IP (core bọc AXI4-Lite + 3 cổng AXI4-Stream; thanh ghi 0x00-0x0C như bản KV260, thêm ngắt
+`irq`, IRQ_ENABLE/IRQ_STATUS, ERROR, JOB_CYCLES, IP_ID/IP_VERSION ở 0x10-0x24; HUONGDAN.md mục 8):
 
-### Bước 1 — vào thư mục dự án
+    openlane/run_flow.sh axi-sim    # slice, shell + model core, testbench gốc với thin/reg/lean(+clock gating)
+    openlane/run_flow.sh axi-shell  # harden riêng phần AXI cho thin, reg, lean, lean_cg; bảng overhead so với core
+    openlane/run_flow.sh axi-gls    # GEMM_top (lean + clock gating) bọc netlist cuối của core
 
-~~~bash
-cd /duong/dan/toi/GEMM_final_DSP_OPENLANE_ASIC
-~~~
+Mỗi tầng chỉ chạy khi tầng trước đã qua. Kết quả ghi vào openlane/LOG.md,
+GDS nằm ở ~/OpenLane/designs/gemm_core/runs/<tag>/results/final/gds/.
 
-### Bước 2 — cài công cụ host
+## Thư mục
 
-~~~bash
-bash OPENLANE_REPRODUCE_MACROSPACED_V2/scripts/00_install_host_tools.sh
-~~~
+    rtl_asic/   RTL cho ASIC (rtl_asic/axi: wrapper AXI của IP)
+    sim/        so sánh với RTL FPGA, mô phỏng gate-level
+    docs/evidence/  dạng sóng RTL, log GLS, đối chiếu golden model (bản v1)
+    docs/paper/     gói số liệu và hình của layout v1
+    openlane/   run_flow.sh và cấu hình từng tầng
+    tools/      đọc log, kiểm tra DRC quanh macro, phân tích antenna, timing và công suất
 
-Script cài hoặc kiểm tra các công cụ cần trên máy host, gồm Podman và các tiện ích shell.
+## Ghi chú thiết kế
 
-### Bước 3 — kiểm tra đầu vào
+- Mỗi SRAM đặt sát phần logic dùng nó. Floorplan đầu gom SRAM thành khối lớn thì global route nghẽn tới mức crash.
+- Cấm đi dây met5 trên SRAM: SRAM đã chặn met1-met4, dây đổi track trên met5 tạo short không sửa được.
+- Sau global route có bước kiểm tra net đi xuyên lòng macro; có thì dừng sớm thay vì chạy DRT vô ích.
+- Tắt diode heuristic (nguồn nghẽn chính); LEF của SRAM được bổ sung dữ liệu antenna để công cụ thấy chân SRAM.
+- Magic DRC đọc cell chuẩn bằng layout đầy đủ, macro bằng abstract; cờ quanh macro được kiểm lại bằng tools/magic_macro_check.sh.
+- repair_timing chạy với -skip_pin_swap, và tầng row so netlist cuối với RTL (sim/row_equiv.sh): LVS không bắt được lỗi đổi chân.
 
-~~~bash
-bash OPENLANE_REPRODUCE_MACROSPACED_V2/scripts/01_preflight.sh "$PWD"
-~~~
+## ERRATA (IP v1)
+Hai lỗi của RTL, có cả trong netlist cuối của IP. RTL và layout của v1 giữ nguyên; **sẽ sửa ở v2**. Test có chủ đích: `sim/run_errata.sh` (RTL đúng cấu hình đã build: `asic-sram`, WRAP=lean, AXIS_CG=1; 11 ca, mọi ca đúng như mô tả dưới đây). GLS trên netlist cuối cho M = 1, M = 2 và job 511 từ feature (73×224×32) giống RTL từng dòng, kể cả ở ca lỗi M = 1 (`docs/paper/data/gls_errata.txt`).
 
-Preflight kiểm tra cấu trúc dự án, RTL, macro views, container image, PDK và dung lượng trước khi chạy.
+**E1. Mỗi bộ đệm chứa ít hơn độ sâu của nó 1 từ (511 / 1023 / 511 thay vì 512 / 1024 / 512).**
+- Nguyên nhân: bộ đếm số từ rộng log2(depth) bit, nên số từ đúng bằng độ sâu quay về 0.
+  - `rtl_asic/In_buffer.v:70-71`: `r_weight_words_expected` 10 bit, `r_feature_words_expected` 9 bit.
+  - `In_buffer.v:106` và `:116-117`: tích `row_count × k_block_count` và `n_block_count × k_block_count × 32` bị cắt.
+  - `In_buffer.v:88-89`: ready = `write_count < expected`.
+  - `In_buffer.v:91`: bắt đầu đọc cần `expected != 0`.
+  - `rtl_asic/Out_buffer.v:52` và `:285`: `r_result_words_expected` 9 bit = `row_count × n_block_count` bị cắt.
+- Điều kiện xảy ra:
+  - feature M·Kb = 512: job treo; chỉ 1 beat được nhận, chính là beat do slice AXI giữ;
+  - weight 32·Kb·Nb = 1024: job treo;
+  - kết quả M·Nb = 512: sai giá trị và thừa beat (580 thay vì 512).
+  - Các kích thước lớn hơn nằm ngoài giới hạn của host bên dưới.
 
-### Bước 4 — tái lập run
+**E2. M = 1 (row_count = 1) cho kết quả sai và thừa beat kết quả.** Kể cả job một tile 1×32×32 cũng sai. Nguyên nhân, xác định bằng vết mô phỏng RTL so M = 1 với M = 2:
+- `rtl_asic/Buffer_feeder.v:109`: `input_feature_last = (feature_cnt == row_count − 1)`. Với row_count = 1, cờ này bằng 1 ở mọi chu kỳ `feature_cnt = 0` mà không kèm valid. `Buffer_feeder.v:130` đưa nó ra `r_compute_input_last` suốt trạng thái SET_FEATURE.
+- `rtl_asic/Gemm_compute_core.v:147` đẩy `last` vào pipeline mà không AND với valid, nên ra nhiều xung `o_partial_last`. Khi đó `Buffer_feeder.v:103` (`total_last`) lặp lại, OutputBuffer kết thúc job nhiều lần, và `In_buffer.v:91-95` (`| i_compute_partial_last`) khởi động đọc lại.
+- Thêm vào đó, `In_buffer.v:232-237`: `r_feature_read_row` được đặt bằng 1 rồi tăng mãi, vì phép so sánh với `row_count − 1 = 0` không bao giờ đúng. Địa chỉ feature của các K-block sau vì vậy sai.
 
-~~~bash
-bash OPENLANE_REPRODUCE_MACROSPACED_V2/scripts/run_all.sh "$PWD"
-~~~
+**Ràng buộc cho host (driver) với IP v1:**
+- **M ≥ 2:** với GEMV (M = 1), đệm thêm một hàng 0 và bỏ hàng kết quả thừa, hoặc chạy trên CPU.
+- **Mỗi job:** M·Kb ≤ 511, 32·Kb·Nb ≤ 1023 (tức Kb·Nb ≤ 31), M·Nb ≤ 511, M ≤ 511, Kb ≤ 31, Nb ≤ 31, với Kb = ⌈K/32⌉, Nb = ⌈N/32⌉.
+- **Ma trận lớn hơn:** chia theo M và N. Không chia theo K, vì kết quả là INT8 sau phép dịch.
 
-**run_all.sh** gọi preflight, chuẩn bị cấu hình cố định và chạy OpenLane. Script không ghi đè run đã tồn tại. Nếu tag **area7000x5500_density40_macrospaced_v2** đã có, script sẽ dừng để bảo vệ dữ liệu.
+## Hạn chế
 
-Chi tiết từng lệnh và cách chạy thủ công nằm trong [RUNBOOK.md](RUNBOOK.md).
+- Resizer của bản OpenROAD này có thể đổi chân của cell không giao hoán (and2b) khi sửa timing, và LVS không bắt được
+  vì layout khớp với netlist đã sai. Flow chặn bằng -skip_pin_swap và so netlist row với RTL (sim/row_equiv.sh) ở tầng row.
+- Antenna: core_v11 chạy riêng còn 219 chân, vì router của OpenLane 1.0.2 không tính antenna khi đi dây và không có
+  chế độ ECO tăng dần. IP gemm_ip đã về 0 nhờ ECO tăng dần bằng OpenROAD mới (tools/eco).
+- Con số 100 MHz của core_v11 chưa kiểm các path đi qua macro (SRAM, row); kiểm đủ thì chỉ khoảng 53 MHz ở tt.
+  Con số khoảng 57 MHz ở corner chậm cũng chưa kiểm path qua macro. IP signoff ở 50 MHz (tt theo lib); setup ss của
+  path chạm macro là −4,94 ns ở chu kỳ 20 ns, chỉ báo.
+- Timing ở cổng I/O được miễn vì core chưa có vòng pad (196 path, tệ nhất -0,81 ns ở tt); đây là core, chưa phải chip hoàn chỉnh.
+- Công suất SRAM là cận trên: thư viện OpenRAM cho cùng năng lượng mỗi cạnh clock dù SRAM có được chọn hay không.
 
-## 8. Chuẩn bị dữ liệu trước khi push
-
-Trên máy tác giả, chạy:
-
-~~~bash
-cd "$HOME/Downloads/GEMM_final_DSP_OPENLANE_ASIC"
-
-bash OPENLANE_REPRODUCE_MACROSPACED_V2/scripts/02_capture_for_push.sh "$PWD"
-bash OPENLANE_REPRODUCE_MACROSPACED_V2/scripts/05_extract_shell_history.sh
-~~~
-
-- **02_capture_for_push.sh** thu cấu hình, checksum và báo cáo nhỏ làm bằng chứng.
-- **05_extract_shell_history.sh** lọc các lệnh OpenLane thực tế từ Bash/Zsh.
-- Cần đọc lại file history trước khi commit để bảo đảm không có token, mật khẩu hoặc thông tin riêng tư.
-
-Không nên push **designs/GemmAccelerator/runs/** vì mỗi run có thể chiếm 8–10 GiB. Chỉ commit source, config, macro views hợp lệ, script tái lập và evidence nhỏ cần thiết.
-
-## 9. Kiểm tra tính toàn vẹn và kết quả
-
-### Kiểm tra gói
-
-~~~bash
-cd OPENLANE_REPRODUCE_MACROSPACED_V2
-sha256sum -c MANIFEST.sha256
-~~~
-
-### Kiểm tra run
-
-~~~bash
-python3 scripts/04_verify_run.py \
-  ../designs/GemmAccelerator/runs/area7000x5500_density40_macrospaced_v2
-~~~
-
-Script xác minh tag run, vị trí macro, các artifact quan trọng và lỗi **GRT-0119** đã biết.
-
-## 10. Ghi chú về khả năng tái lập
-
-- **archive/gemm_macro_spaced_v2_original.py** là script lịch sử đã dùng để tạo run.
-- **scripts/03_reproduce_macrospaced_v2.py** là bản dùng cho clone mới: không phụ thuộc vào một baseline run cũ nhưng giữ nguyên image, PDK, cấu hình die/core, mật độ và tọa độ macro.
-- Pin assignment, placement và routing vẫn có thể thay đổi nếu dùng phiên bản OpenLane, PDK hoặc macro view khác. Vì vậy image và PDK snapshot đã được cố định.
-- Các lệnh thử nghiệm của những run cũ không thể suy ra đầy đủ chỉ từ thư mục **runs**. Tài liệu chỉ ghi số liệu đã xác nhận; shell history thực tế được thu riêng bằng script.
-- Mục tiêu 10 ns là constraint đầu vào, không phải bằng chứng thiết kế đã đạt 100 MHz sau signoff.
-
-## 11. Thứ tự đọc đề xuất
-
-| Thứ tự | Tài liệu | Khi nào cần đọc |
-|---:|---|---|
-| 1 | **README.md** | Hiểu toàn bộ dự án và trạng thái hiện tại |
-| 2 | **ENVIRONMENT.md** | Chuẩn bị đúng công cụ, image và PDK |
-| 3 | **RUNBOOK.md** | Build lại từng bước |
-| 4 | **HISTORY_AND_RESULTS.md** | Hiểu vì sao chọn macrospaced_v2 |
-| 5 | **git/GIT_PUSH_GUIDE.md** | Đưa source và bằng chứng lên Git |
-| 6 | **COMMANDS_COPY_PASTE.sh** | Tra nhanh các lệnh thường dùng |
-
-Nếu mục tiêu là tiếp tục tối ưu để đạt GDS, hãy bắt đầu từ báo cáo congestion của **macrospaced_v2**, sau đó thử điều chỉnh pin placement, phân vùng logic, macro channels/halos và chiến lược CTS thay vì coi run này là kết quả signoff.
+Lịch sử các lần chạy: NHATKY.md.
